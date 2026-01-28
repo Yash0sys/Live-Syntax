@@ -14,4 +14,19 @@ export const ACTIONS = {
   WAITING_FOR_APPROVAL: "waiting-for-approval",
   HOST_CHANGED: "host-changed",
   CURSOR_CHANGE: "cursor-change",
+  // Voice call actions
+  JOIN_CALL: "join-call",
+  LEAVE_CALL: "leave-call",
+  CALL_USER_JOINED: "call-user-joined",
+  CALL_USER_LEFT: "call-user-left",
+  WEBRTC_OFFER: "webrtc-offer",
+  WEBRTC_ANSWER: "webrtc-answer",
+  WEBRTC_ICE_CANDIDATE: "webrtc-ice-candidate",
+  // File system actions
+  FILE_STRUCTURE_SYNC: "file-structure-sync",
+  FILE_STRUCTURE_UPDATE: "file-structure-update",
+  FILE_CREATE: "file-create",
+  FILE_DELETE: "file-delete",
+  FILE_RENAME: "file-rename",
+  FOLDER_CREATE: "folder-create",
 };

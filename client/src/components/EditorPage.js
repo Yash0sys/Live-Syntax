@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import Client from "./Client";
 import Editor from "./Editor";
+import FileExplorer, { getLanguageFromFile } from "./FileExplorer";
+import FileTabs from "./FileTabs";
 import { initSocket } from "../Socket";
 import { ACTIONS } from "../Actions";
 import {
@@ -11,6 +13,7 @@ import {
 } from "react-router-dom";
 import { toast } from "react-hot-toast";
 import axios from "axios";
+import WebRTCManager from "../WebRTCManager";
 
 // List of supported languages
 const LANGUAGES = [
@@ -19,6 +22,19 @@ const LANGUAGES = [
   "cpp",
   "c",
 ];
+
+// Initial file structure
+const getInitialFileStructure = () => ({
+  name: "root",
+  type: "folder",
+  children: {
+    "index.js": {
+      name: "index.js",
+      type: "file",
+      content: "// Welcome to Live Syntax!\n// Create files and folders to build your project\n\nconsole.log('Hello, World!');\n",
+    },
+  },
+});
 
 function EditorPage() {
   const [clients, setClients] = useState([]);
@@ -32,6 +48,17 @@ function EditorPage() {
   const [programInput, setProgramInput] = useState("");
   const [joinRequests, setJoinRequests] = useState([]);
   const [isWaitingForApproval, setIsWaitingForApproval] = useState(false);
+  const [isInCall, setIsInCall] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  
+  // File system state
+  const [fileStructure, setFileStructure] = useState(getInitialFileStructure());
+  const [openFiles, setOpenFiles] = useState(["/root/index.js"]);
+  const [activeFile, setActiveFile] = useState("/root/index.js");
+  const [fileContents, setFileContents] = useState({
+    "/root/index.js": "// Welcome to Live Syntax!\n// Create files and folders to build your project\n\nconsole.log('Hello, World!');\n",
+  });
+
   const codeRef = useRef(null);
 
   const Location = useLocation();
@@ -39,6 +66,7 @@ function EditorPage() {
   const { roomId } = useParams();
 
   const socketRef = useRef(null);
+  const webrtcManagerRef = useRef(null);
 
   useEffect(() => {
     const init = async () => {
@@ -67,8 +95,11 @@ function EditorPage() {
             toast.success(`${username} joined the room.`);
           }
           setClients(clients);
-          socketRef.current.emit(ACTIONS.SYNC_CODE, {
-            code: codeRef.current,
+          
+          // Sync file structure to new user
+          socketRef.current.emit(ACTIONS.FILE_STRUCTURE_SYNC, {
+            fileStructure,
+            fileContents,
             socketId,
           });
         }
@@ -106,10 +137,21 @@ function EditorPage() {
           toast.success(`${newHostUsername} is now the host`);
         }
       });
+
+      // Handle file structure sync
+      socketRef.current.on(ACTIONS.FILE_STRUCTURE_UPDATE, ({ fileStructure: newStructure, fileContents: newContents }) => {
+        setFileStructure(newStructure);
+        setFileContents(newContents);
+      });
     };
     init();
 
     return () => {
+      // Cleanup WebRTC before disconnecting socket
+      if (webrtcManagerRef.current) {
+        webrtcManagerRef.current.cleanup();
+      }
+      
       socketRef.current && socketRef.current.disconnect();
       socketRef.current.off(ACTIONS.JOINED);
       socketRef.current.off(ACTIONS.DISCONNECTED);
@@ -117,6 +159,7 @@ function EditorPage() {
       socketRef.current.off(ACTIONS.JOIN_REJECTED);
       socketRef.current.off(ACTIONS.WAITING_FOR_APPROVAL);
       socketRef.current.off(ACTIONS.HOST_CHANGED);
+      socketRef.current.off(ACTIONS.FILE_STRUCTURE_UPDATE);
     };
   }, []);
 
@@ -156,6 +199,169 @@ function EditorPage() {
     navigate("/");
   };
 
+  // File system helper functions
+  const setItemAtPath = (structure, path, item) => {
+    const parts = path.split('/').filter(p => p && p !== 'root');
+    let current = structure;
+    
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!current.children[parts[i]]) {
+        current.children[parts[i]] = { name: parts[i], type: 'folder', children: {} };
+      }
+      current = current.children[parts[i]];
+    }
+    
+    const lastName = parts[parts.length - 1];
+    current.children[lastName] = item;
+    return { ...structure };
+  };
+
+  const deleteItemAtPath = (structure, path) => {
+    const parts = path.split('/').filter(p => p && p !== 'root');
+    let current = structure;
+    
+    for (let i = 0; i < parts.length - 1; i++) {
+      current = current.children[parts[i]];
+    }
+    
+    const lastName = parts[parts.length - 1];
+    delete current.children[lastName];
+    return { ...structure };
+  };
+
+  const handleFileSelect = (path, content) => {
+    setActiveFile(path);
+    if (!openFiles.includes(path)) {
+      setOpenFiles([...openFiles, path]);
+    }
+    if (!fileContents[path]) {
+      setFileContents({ ...fileContents, [path]: content || "" });
+    }
+  };
+
+  const handleCloseFile = (path) => {
+    const newOpenFiles = openFiles.filter(f => f !== path);
+    setOpenFiles(newOpenFiles);
+    
+    if (activeFile === path && newOpenFiles.length > 0) {
+      setActiveFile(newOpenFiles[newOpenFiles.length - 1]);
+    }
+  };
+
+  const handleCreateFile = (path) => {
+    const fileName = path.split('/').pop();
+    const newStructure = setItemAtPath(fileStructure, path, {
+      name: fileName,
+      type: 'file',
+      content: '',
+    });
+    
+    setFileStructure(newStructure);
+    setFileContents({ ...fileContents, [path]: '' });
+    setOpenFiles([...openFiles, path]);
+    setActiveFile(path);
+    
+    // Broadcast to all users
+    socketRef.current.emit(ACTIONS.FILE_CREATE, {
+      roomId,
+      path,
+      fileName,
+    });
+  };
+
+  const handleCreateFolder = (path) => {
+    const folderName = path.split('/').pop();
+    const newStructure = setItemAtPath(fileStructure, path, {
+      name: folderName,
+      type: 'folder',
+      children: {},
+    });
+    
+    setFileStructure(newStructure);
+    
+    // Broadcast to all users
+    socketRef.current.emit(ACTIONS.FOLDER_CREATE, {
+      roomId,
+      path,
+      folderName,
+    });
+  };
+
+  const handleDeleteItem = (path) => {
+    const newStructure = deleteItemAtPath(fileStructure, path);
+    setFileStructure(newStructure);
+    
+    // Close file if open
+    if (openFiles.includes(path)) {
+      handleCloseFile(path);
+    }
+    
+    // Remove from fileContents
+    const newContents = { ...fileContents };
+    delete newContents[path];
+    setFileContents(newContents);
+    
+    // Broadcast to all users
+    socketRef.current.emit(ACTIONS.FILE_DELETE, {
+      roomId,
+      path,
+    });
+  };
+
+  const handleRenameItem = (oldPath, newPath) => {
+    // Get item at old path
+    const parts = oldPath.split('/').filter(p => p && p !== 'root');
+    let current = fileStructure;
+    
+    for (let i = 0; i < parts.length - 1; i++) {
+      current = current.children[parts[i]];
+    }
+    
+    const item = current.children[parts[parts.length - 1]];
+    
+    // Update name
+    const newName = newPath.split('/').pop();
+    const updatedItem = { ...item, name: newName };
+    
+    // Delete old and add new
+    let newStructure = deleteItemAtPath(fileStructure, oldPath);
+    newStructure = setItemAtPath(newStructure, newPath, updatedItem);
+    setFileStructure(newStructure);
+    
+    // Update open files
+    if (openFiles.includes(oldPath)) {
+      setOpenFiles(openFiles.map(f => f === oldPath ? newPath : f));
+    }
+    
+    // Update active file
+    if (activeFile === oldPath) {
+      setActiveFile(newPath);
+    }
+    
+    // Update file contents
+    if (fileContents[oldPath]) {
+      const newContents = { ...fileContents };
+      newContents[newPath] = newContents[oldPath];
+      delete newContents[oldPath];
+      setFileContents(newContents);
+    }
+    
+    // Broadcast to all users
+    socketRef.current.emit(ACTIONS.FILE_RENAME, {
+      roomId,
+      oldPath,
+      newPath,
+    });
+  };
+
+  const handleCodeChange = (code) => {
+    codeRef.current = code;
+    setFileContents({
+      ...fileContents,
+      [activeFile]: code,
+    });
+  };
+
   const handleApproveJoin = (socketId, username) => {
     socketRef.current.emit(ACTIONS.APPROVE_JOIN, { socketId, roomId });
     setJoinRequests((prev) => prev.filter((req) => req.socketId !== socketId));
@@ -171,8 +377,11 @@ function EditorPage() {
   const runCode = async () => {
     setIsCompiling(true);
     try {
+      // Get the code from the active file
+      const currentCode = fileContents[activeFile] || "";
+      
       const response = await axios.post(`${process.env.REACT_APP_BACKEND_URL}/compile`, {
-        code: codeRef.current,
+        code: currentCode,
         language: selectedLanguage,
         input: programInput, // Include program input
       });
@@ -191,10 +400,14 @@ function EditorPage() {
     setIsAiLoading(true);
     setAiResponse("");
     try {
+      // Get the code from the active file
+      const currentCode = fileContents[activeFile] || "";
+      const fileExtension = activeFile ? activeFile.split('.').pop() : 'js';
+      
       const response = await axios.post(`${process.env.REACT_APP_BACKEND_URL}/ai`, {
         prompt: aiPrompt,
-        code: codeRef.current || "",
-        language: selectedLanguage,
+        code: currentCode,
+        language: fileExtension,
       });
       setAiResponse(response.data.reply || JSON.stringify(response.data));
     } catch (err) {
@@ -208,6 +421,46 @@ function EditorPage() {
 
   const toggleCompileWindow = () => {
     setIsCompileWindowOpen(!isCompileWindowOpen);
+  };
+
+  // Voice call handlers
+  const handleJoinCall = async () => {
+    try {
+      // Always create a fresh WebRTCManager instance to avoid stale state
+      if (webrtcManagerRef.current) {
+        webrtcManagerRef.current.cleanup();
+      }
+      
+      webrtcManagerRef.current = new WebRTCManager(
+        socketRef,
+        roomId,
+        Location.state?.username
+      );
+
+      await webrtcManagerRef.current.joinCall(clients);
+      setIsInCall(true);
+      toast.success("Joined voice call");
+    } catch (error) {
+      console.error("Error joining call:", error);
+      toast.error(error.message || "Failed to join call");
+    }
+  };
+
+  const handleLeaveCall = () => {
+    if (webrtcManagerRef.current) {
+      webrtcManagerRef.current.leaveCall();
+      setIsInCall(false);
+      setIsMuted(false);
+      toast.success("Left voice call");
+    }
+  };
+
+  const handleToggleMute = () => {
+    if (webrtcManagerRef.current) {
+      const muted = webrtcManagerRef.current.toggleMute();
+      setIsMuted(muted);
+      toast.success(muted ? "Microphone muted" : "Microphone unmuted");
+    }
   };
 
   return (
@@ -263,7 +516,7 @@ function EditorPage() {
 
       <div className="row flex-grow-1">
         {/* Client panel */}
-        <div className="col-md-2 bg-dark text-light d-flex flex-column">
+        <div className="col-md-2 bg-dark text-light d-flex flex-column" style={{ minWidth: '200px' }}>
           <img
             src="/images/LiveSyntaxRectangle.png"
             alt="Live Syntax Logo"
@@ -272,17 +525,67 @@ function EditorPage() {
           />
           <hr />
 
-          {/* Client list container */}
-          <div className="d-flex flex-column flex-grow-1 overflow-auto">
-            <span className="mb-2">Members</span>
+          {/* Client list container - Fixed height with scroll */}
+          <div style={{ maxHeight: '200px', minHeight: '100px', overflow: 'auto' }}>
+            <span className="mb-2 d-block">Members</span>
             {clients.map((client) => (
-              <Client key={client.socketId} username={client.username} isHost={client.isHost} />
+              <Client 
+                key={client.socketId} 
+                username={client.username} 
+                isHost={client.isHost}
+                inCall={client.socketId === socketRef.current?.id && isInCall}
+              />
             ))}
+          </div>
+
+          <hr />
+          
+          {/* File Explorer - Takes remaining space */}
+          <div className="flex-grow-1 d-flex flex-column" style={{ minHeight: 0, overflow: 'hidden' }}>
+            <FileExplorer
+              fileStructure={fileStructure}
+              onFileSelect={handleFileSelect}
+              onCreateFile={handleCreateFile}
+              onCreateFolder={handleCreateFolder}
+              onDeleteItem={handleDeleteItem}
+              onRenameItem={handleRenameItem}
+            />
           </div>
 
           <hr />
           {/* Buttons */}
           <div className="mt-auto mb-3">
+            {/* Voice call controls */}
+            {!isInCall ? (
+              <button 
+                className="btn btn-outline-primary w-100 mb-2" 
+                onClick={handleJoinCall}
+                title="Join voice call with room members"
+              >
+                <i className="bi bi-telephone-fill me-2"></i>
+                Join Call
+              </button>
+            ) : (
+              <div className="mb-2">
+                <button 
+                  className="btn btn-danger w-100 mb-2" 
+                  onClick={handleLeaveCall}
+                  title="Leave voice call"
+                >
+                  <i className="bi bi-telephone-x-fill me-2"></i>
+                  Leave Call
+                </button>
+                <button 
+                  className={`btn ${isMuted ? 'btn-warning' : 'btn-outline-secondary'} w-100`}
+                  onClick={handleToggleMute}
+                  title={isMuted ? "Unmute microphone" : "Mute microphone"}
+                >
+                  <i className={`bi ${isMuted ? 'bi-mic-mute-fill' : 'bi-mic-fill'} me-2`}></i>
+                  {isMuted ? 'Unmute' : 'Mute'}
+                </button>
+              </div>
+            )}
+            
             <button className="btn btn-outline-success w-100 mb-2" onClick={copyRoomId}>
               Copy Room ID
             </button>
@@ -293,9 +596,22 @@ function EditorPage() {
         </div>
 
         {/* Editor panel */}
-        <div className="col-md-8 text-light d-flex flex-column">
+        <div className="col-md-8 text-light d-flex flex-column" style={{ padding: 0 }}>
+          {/* File Tabs */}
+          <FileTabs
+            openFiles={openFiles}
+            activeFile={activeFile}
+            onSelectFile={(path) => {
+              setActiveFile(path);
+            }}
+            onCloseFile={handleCloseFile}
+          />
+
           {/* Language selector */}
-          <div className="bg-dark p-2 d-flex justify-content-end">
+          <div className="bg-dark p-2 d-flex justify-content-between align-items-center border-bottom border-secondary">
+            <span className="text-muted" style={{ fontSize: '0.85rem' }}>
+              {activeFile && <><i className="bi bi-file-earmark-code me-2"></i>{activeFile}</>}
+            </span>
             <select
               className="form-select w-auto"
               value={selectedLanguage}
@@ -312,9 +628,10 @@ function EditorPage() {
           <Editor
             socketRef={socketRef}
             roomId={roomId}
-            onCodeChange={(code) => {
-              codeRef.current = code;
-            }}
+            onCodeChange={handleCodeChange}
+            activeFile={activeFile}
+            fileContent={fileContents[activeFile] || ""}
+            language={activeFile ? getLanguageFromFile(activeFile) : "javascript"}
           />
         </div>
 

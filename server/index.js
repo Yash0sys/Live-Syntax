@@ -47,6 +47,8 @@ const io = new Server(server, {
 const userSocketMap = {};
 const roomHosts = {}; // Track the host (first user) of each room
 const pendingJoinRequests = {}; // Track users waiting for approval
+const roomFileStructures = {}; // Track file structure for each room
+const roomFileContents = {}; // Track file contents for each room
 
 const getAllConnectedClients = (roomId) => {
   return Array.from(io.sockets.adapter.rooms.get(roomId) || []).map(
@@ -168,8 +170,13 @@ io.on("connection", (socket) => {
   });
 
   // sync the code - broadcast changes to all other users in the room
-  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change }) => {
-    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code, change });
+  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change, filePath }) => {
+    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code, change, filePath });
+    
+    // Update file content in room storage
+    if (filePath && roomFileContents[roomId]) {
+      roomFileContents[roomId][filePath] = code;
+    }
   });
   
   // sync cursor positions
@@ -182,9 +189,101 @@ io.on("connection", (socket) => {
     });
   });
   
+  // File structure sync - when new user joins, send them the file structure
+  socket.on(ACTIONS.FILE_STRUCTURE_SYNC, ({ fileStructure, fileContents, socketId }) => {
+    // Store the file structure for this room
+    const roomId = Array.from(socket.rooms).find(r => r !== socket.id);
+    if (!roomFileStructures[roomId]) {
+      roomFileStructures[roomId] = fileStructure;
+      roomFileContents[roomId] = fileContents;
+    }
+    
+    // Send current room's file structure to the new user
+    io.to(socketId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: roomFileContents[roomId],
+    });
+  });
+  
+  // File operations - broadcast to all users in room
+  socket.on(ACTIONS.FILE_CREATE, ({ roomId, path, fileName }) => {
+    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      action: 'create-file',
+      path,
+      fileName,
+    });
+  });
+  
+  socket.on(ACTIONS.FOLDER_CREATE, ({ roomId, path, folderName }) => {
+    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      action: 'create-folder',
+      path,
+      folderName,
+    });
+  });
+  
+  socket.on(ACTIONS.FILE_DELETE, ({ roomId, path }) => {
+    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      action: 'delete',
+      path,
+    });
+  });
+  
+  socket.on(ACTIONS.FILE_RENAME, ({ roomId, oldPath, newPath }) => {
+    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      action: 'rename',
+      oldPath,
+      newPath,
+    });
+  });
+  
   // when new user join the room all the code which are there are also shows on that persons editor
   socket.on(ACTIONS.SYNC_CODE, ({ socketId, code }) => {
     io.to(socketId).emit(ACTIONS.CODE_CHANGE, { code });
+  });
+
+  // Voice call signaling handlers
+  socket.on(ACTIONS.JOIN_CALL, ({ roomId }) => {
+    // Notify all other users in the room that this user joined the call
+    socket.to(roomId).emit(ACTIONS.CALL_USER_JOINED, {
+      socketId: socket.id,
+      username: userSocketMap[socket.id],
+    });
+    console.log(`${userSocketMap[socket.id]} joined call in room ${roomId}`);
+  });
+
+  socket.on(ACTIONS.LEAVE_CALL, ({ roomId }) => {
+    // Notify all other users in the room that this user left the call
+    socket.to(roomId).emit(ACTIONS.CALL_USER_LEFT, {
+      socketId: socket.id,
+      username: userSocketMap[socket.id],
+    });
+    console.log(`${userSocketMap[socket.id]} left call in room ${roomId}`);
+  });
+
+  socket.on(ACTIONS.WEBRTC_OFFER, ({ offer, to, roomId }) => {
+    // Forward WebRTC offer to specific peer
+    io.to(to).emit(ACTIONS.WEBRTC_OFFER, {
+      offer,
+      from: socket.id,
+      username: userSocketMap[socket.id],
+    });
+  });
+
+  socket.on(ACTIONS.WEBRTC_ANSWER, ({ answer, to }) => {
+    // Forward WebRTC answer to specific peer
+    io.to(to).emit(ACTIONS.WEBRTC_ANSWER, {
+      answer,
+      from: socket.id,
+    });
+  });
+
+  socket.on(ACTIONS.WEBRTC_ICE_CANDIDATE, ({ candidate, to }) => {
+    // Forward ICE candidate to specific peer
+    io.to(to).emit(ACTIONS.WEBRTC_ICE_CANDIDATE, {
+      candidate,
+      from: socket.id,
+    });
   });
 
   // leave room
@@ -211,6 +310,8 @@ io.on("connection", (socket) => {
         if (remainingClients.length === 0) {
           delete roomHosts[roomId];
           delete pendingJoinRequests[roomId];
+          delete roomFileStructures[roomId];
+          delete roomFileContents[roomId];
         } else {
           // Transfer host to the next person (first remaining client)
           const newHost = remainingClients[0];

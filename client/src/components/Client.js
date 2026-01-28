@@ -11,7 +11,7 @@ const getUserColor = (username) => {
   return `hsl(${hue}, 70%, 60%)`;
 };
 
-function Client({username, isHost}) {
+function Client({username, isHost, inCall}) {
   const userColor = getUserColor(username.toString());
 
   return (
@@ -23,7 +23,10 @@ function Client({username, isHost}) {
         className="mr-3"
         color={userColor}
       />
-      <span className='mx-2'>{username.toString()} {isHost && '(Host)'}</span>
+      <span className='mx-2'>
+        {username.toString()} {isHost && '(Host)'}
+        {inCall && <i className="bi bi-mic-fill ms-2 text-success" title="In call"></i>}
+      </span>
     </div>
   );
 }

@@ -1,5 +1,12 @@
 import React, { useEffect, useRef } from "react";
 import "codemirror/mode/javascript/javascript";
+import "codemirror/mode/python/python";
+import "codemirror/mode/clike/clike";
+import "codemirror/mode/htmlmixed/htmlmixed";
+import "codemirror/mode/css/css";
+import "codemirror/mode/xml/xml";
+import "codemirror/mode/markdown/markdown";
+import "codemirror/mode/sql/sql";
 import "codemirror/theme/dracula.css";
 import "codemirror/addon/edit/closetag";
 import "codemirror/addon/edit/closebrackets";
@@ -47,18 +54,19 @@ const getUserColorWithAlpha = (username, alpha = 0.3) => {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 };
 
-function Editor({ socketRef, roomId, onCodeChange }) {
+function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, language }) {
   const editorRef = useRef(null);
   const remoteCursorsRef = useRef({}); // Track remote cursor widgets
   const remoteSelectionsRef = useRef({}); // Track remote selections
   const suppressRemoteChangeRef = useRef(false); // Flag to prevent circular updates
+  const currentFileRef = useRef(activeFile);
 
   useEffect(() => {
     const init = async () => {
       const editor = CodeMirror.fromTextArea(
         document.getElementById("realtimeEditor"),
         {
-          mode: { name: "javascript", json: true },
+          mode: { name: language || "javascript", json: true },
           theme: "dracula",
           autoCloseTags: true,
           autoCloseBrackets: true,
@@ -100,7 +108,8 @@ function Editor({ socketRef, roomId, onCodeChange }) {
               to: changeObj.to,
               text: changeObj.text,
               origin: changeObj.origin
-            }
+            },
+            filePath: currentFileRef.current, // Include file path in sync
           });
         }
       });
@@ -109,12 +118,34 @@ function Editor({ socketRef, roomId, onCodeChange }) {
     init();
   }, []);
 
+  // Update editor content when active file changes
+  useEffect(() => {
+    if (editorRef.current && activeFile) {
+      currentFileRef.current = activeFile;
+      suppressRemoteChangeRef.current = true;
+      
+      const cursor = editorRef.current.getCursor();
+      editorRef.current.setValue(fileContent || "");
+      editorRef.current.setCursor(cursor);
+      
+      // Change language mode based on file
+      if (language) {
+        editorRef.current.setOption("mode", language);
+      }
+      
+      setTimeout(() => {
+        suppressRemoteChangeRef.current = false;
+      }, 10);
+    }
+  }, [activeFile, fileContent, language]);
+
   // Handle incoming code and cursor changes
   useEffect(() => {
     if (socketRef.current) {
       // Handle code changes - apply delta changes instead of replacing entire document
-      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, change }) => {
-        if (editorRef.current) {
+      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, change, filePath }) => {
+        // Only update if the change is for the currently active file
+        if (editorRef.current && (!filePath || filePath === currentFileRef.current)) {
           suppressRemoteChangeRef.current = true;
           
           // If we have change delta, apply it; otherwise use full code sync
