@@ -31,7 +31,7 @@ const getInitialFileStructure = () => ({
     "index.js": {
       name: "index.js",
       type: "file",
-      content: "// Welcome to Live Syntax!\n// Create files and folders to build your project\n\nconsole.log('Hello, World!');\n",
+      content: "// Welcome to Live Syntax!\n// Create files and folders to build your project\n",
     },
   },
 });
@@ -56,10 +56,31 @@ function EditorPage() {
   const [openFiles, setOpenFiles] = useState(["/root/index.js"]);
   const [activeFile, setActiveFile] = useState("/root/index.js");
   const [fileContents, setFileContents] = useState({
-    "/root/index.js": "// Welcome to Live Syntax!\n// Create files and folders to build your project\n\nconsole.log('Hello, World!');\n",
+    "/root/index.js": "// Welcome to Live Syntax!\n// Create files and folders to build your project\n",
   });
 
   const codeRef = useRef(null);
+
+  // Safeguard: Save current file content before switching
+  useEffect(() => {
+    // When activeFile changes, ensure we save the content from codeRef
+    return () => {
+      if (codeRef.current !== null && activeFile) {
+        setFileContents((prevContents) => ({
+          ...prevContents,
+          [activeFile]: codeRef.current,
+        }));
+        console.log("Cleanup save:", { activeFile, code: codeRef.current?.substring(0, 30) });
+      }
+    };
+  }, [activeFile]);
+
+  // Panel resize state
+  const [leftPanelWidth, setLeftPanelWidth] = useState(20); // percentage
+  const [rightPanelWidth, setRightPanelWidth] = useState(20); // percentage
+  const [isResizingLeft, setIsResizingLeft] = useState(false);
+  const [isResizingRight, setIsResizingRight] = useState(false);
+  const containerRef = useRef(null);
 
   const Location = useLocation();
   const navigate = useNavigate();
@@ -67,6 +88,16 @@ function EditorPage() {
 
   const socketRef = useRef(null);
   const webrtcManagerRef = useRef(null);
+
+  // Ensure active file is initialized in fileContents when tab switching
+  useEffect(() => {
+    if (activeFile && !fileContents[activeFile]) {
+      setFileContents((prevContents) => ({
+        ...prevContents,
+        [activeFile]: "",
+      }));
+    }
+  }, [activeFile]);
 
   useEffect(() => {
     const init = async () => {
@@ -140,8 +171,33 @@ function EditorPage() {
 
       // Handle file structure sync
       socketRef.current.on(ACTIONS.FILE_STRUCTURE_UPDATE, ({ fileStructure: newStructure, fileContents: newContents }) => {
-        setFileStructure(newStructure);
-        setFileContents(newContents);
+        console.log("📥 FILE_STRUCTURE_UPDATE received:", { 
+          files: Object.keys(newContents || {}),
+          newContents: newContents
+        });
+        if (newStructure) {
+          console.log("📁 Setting fileStructure:", newStructure);
+          setFileStructure(newStructure);
+        }
+        if (newContents) {
+          // ⚠️ IMPORTANT: REPLACE fileContents completely with MongoDB data only
+          // Do NOT merge - this ensures we only show what's in MongoDB, no stale cached data
+          console.log("💾 FileContents REPLACED with MongoDB data:", { 
+            incomingFiles: Object.keys(newContents),
+            newContents: newContents
+          });
+          setFileContents(newContents);
+        }
+      });
+
+      // Handle code changes from other users
+      // ⚠️ IMPORTANT: Do NOT update fileContents here!
+      // MongoDB (via FILE_STRUCTURE_UPDATE) is the source of truth
+      // CodeMirror shows real-time typing, fileContents is only for file persistence
+      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, filePath }) => {
+        console.log("📨 CODE_CHANGE received from server:", { filePath, codeLength: code?.length });
+        // Content is already shown in real-time by CodeMirror
+        // Persistence is handled by FILE_STRUCTURE_UPDATE from MongoDB
       });
     };
     init();
@@ -160,8 +216,40 @@ function EditorPage() {
       socketRef.current.off(ACTIONS.WAITING_FOR_APPROVAL);
       socketRef.current.off(ACTIONS.HOST_CHANGED);
       socketRef.current.off(ACTIONS.FILE_STRUCTURE_UPDATE);
+      socketRef.current.off(ACTIONS.CODE_CHANGE);
     };
   }, []);
+
+  // Handle panel resizing
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!containerRef.current) return;
+
+      if (isResizingLeft) {
+        const containerRect = containerRef.current.getBoundingClientRect();
+        const newLeftWidth = Math.max(15, Math.min(50, (e.clientX / containerRect.width) * 100));
+        setLeftPanelWidth(newLeftWidth);
+      } else if (isResizingRight) {
+        const containerRect = containerRef.current.getBoundingClientRect();
+        const newRightWidth = Math.max(15, Math.min(50, ((containerRect.width - e.clientX) / containerRect.width) * 100));
+        setRightPanelWidth(newRightWidth);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsResizingLeft(false);
+      setIsResizingRight(false);
+    };
+
+    if (isResizingLeft || isResizingRight) {
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+      return () => {
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+      };
+    }
+  }, [isResizingLeft, isResizingRight]);
 
   if (!Location.state) {
     return <Navigate to="/" />;
@@ -239,7 +327,43 @@ function EditorPage() {
     }
   };
 
+  const handleTabSelect = (path) => {
+    console.log("🔄 Switching to file:", { path, hasContent: !!fileContents[path], contentLength: fileContents[path]?.length || 0 });
+    
+    // CRITICAL: Save current file content BEFORE switching
+    if (activeFile && codeRef.current !== null) {
+      setFileContents((prevContents) => {
+        const updated = { ...prevContents, [activeFile]: codeRef.current };
+        console.log("💾 SAVED current file before switching:", { activeFile, contentLength: codeRef.current?.length });
+        return updated;
+      });
+    }
+    
+    // Ensure new file is initialized in fileContents before switching tab
+    setFileContents((prevContents) => {
+      const updated = { ...prevContents };
+      if (!updated[path]) {
+        console.log("📌 File not in fileContents, initializing with empty string:", { path });
+        updated[path] = "";
+      }
+      console.log("📌 Ready to load file:", { path, keysCount: Object.keys(updated).length });
+      return updated;
+    });
+    
+    // Switch to the file tab
+    setActiveFile(path);
+  };
+
   const handleCloseFile = (path) => {
+    // Save this file's content before closing it
+    if (codeRef.current !== null && path === activeFile) {
+      setFileContents((prevContents) => ({
+        ...prevContents,
+        [path]: codeRef.current,
+      }));
+      console.log("💾 SAVED file before closing:", { path });
+    }
+    
     const newOpenFiles = openFiles.filter(f => f !== path);
     setOpenFiles(newOpenFiles);
     
@@ -354,11 +478,27 @@ function EditorPage() {
     });
   };
 
-  const handleCodeChange = (code) => {
+  const handleCodeChange = (code, filePath = activeFile) => {
     codeRef.current = code;
-    setFileContents({
-      ...fileContents,
-      [activeFile]: code,
+    // Validate filePath before updating
+    if (!filePath) {
+      console.warn("❌ handleCodeChange: filePath is empty, skipping update", { code: code?.substring(0, 30) });
+      return;
+    }
+    console.log("✍️ handleCodeChange called:", { filePath, codeLength: code?.length });
+    
+    // Update fileContents for ACTIVE file only (so user sees their edits while typing)
+    // This file's content will be confirmed by MongoDB via FILE_STRUCTURE_UPDATE
+    setFileContents((prevContents) => {
+      const updated = { ...prevContents, [filePath]: code };
+      return updated;
+    });
+    
+    // Emit CODE_CHANGE to server (and it will broadcast to others)
+    socketRef.current.emit(ACTIONS.CODE_CHANGE, {
+      roomId,
+      code,
+      filePath,
     });
   };
 
@@ -463,8 +603,27 @@ function EditorPage() {
     }
   };
 
+  const handleSaveProject = async () => {
+    try {
+      const response = await axios.post(
+        `${process.env.REACT_APP_BACKEND_URL}/save-project`,
+        {
+          roomId,
+          fileStructure,
+          fileContents,
+          projectName: `Project-${roomId.slice(0, 8)}`,
+        }
+      );
+      toast.success("Project saved successfully!");
+      console.log("Project saved:", response.data);
+    } catch (err) {
+      console.error("Error saving project:", err);
+      toast.error(err.response?.data?.error || "Failed to save project");
+    }
+  };
+
   return (
-    <div className="container-fluid vh-100 d-flex flex-column">
+    <div className="container-fluid vh-100 d-flex flex-column" ref={containerRef}>
       {/* Join Requests Modal/Notification */}
       {joinRequests.length > 0 && (
         <div
@@ -514,9 +673,19 @@ function EditorPage() {
         </div>
       )}
 
-      <div className="row flex-grow-1">
-        {/* Client panel */}
-        <div className="col-md-2 bg-dark text-light d-flex flex-column" style={{ minWidth: '200px' }}>
+      <div style={{ display: 'flex', flexGrow: 1 }}>
+        {/* Left Panel - Members & Explorer */}
+        <div 
+          style={{ 
+            width: `${leftPanelWidth}%`,
+            backgroundColor: '#1a1d29',
+            color: 'white',
+            display: 'flex',
+            flexDirection: 'column',
+            minWidth: '200px',
+            overflow: 'hidden'
+          }}
+        >
           <img
             src="/images/LiveSyntaxRectangle.png"
             alt="Live Syntax Logo"
@@ -541,7 +710,7 @@ function EditorPage() {
           <hr />
           
           {/* File Explorer - Takes remaining space */}
-          <div className="flex-grow-1 d-flex flex-column" style={{ minHeight: 0, overflow: 'hidden' }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
             <FileExplorer
               fileStructure={fileStructure}
               onFileSelect={handleFileSelect}
@@ -554,7 +723,7 @@ function EditorPage() {
 
           <hr />
           {/* Buttons */}
-          <div className="mt-auto mb-3">
+          <div style={{ marginTop: 'auto', marginBottom: '1rem' }}>
             {/* Voice call controls */}
             {!isInCall ? (
               <button 
@@ -586,6 +755,10 @@ function EditorPage() {
               </div>
             )}
             
+            <button className="btn btn-outline-info w-100 mb-2" onClick={handleSaveProject}>
+              <i className="bi bi-cloud-arrow-up me-2"></i>
+              Save Project
+            </button>
             <button className="btn btn-outline-success w-100 mb-2" onClick={copyRoomId}>
               Copy Room ID
             </button>
@@ -595,15 +768,35 @@ function EditorPage() {
           </div>
         </div>
 
-        {/* Editor panel */}
-        <div className="col-md-8 text-light d-flex flex-column" style={{ padding: 0 }}>
+        {/* Left Resize Handle */}
+        <div
+          onMouseDown={() => setIsResizingLeft(true)}
+          style={{
+            width: '5px',
+            backgroundColor: isResizingLeft ? '#0d6efd' : '#495057',
+            cursor: 'col-resize',
+            transition: isResizingLeft ? 'none' : 'background-color 0.2s',
+            userSelect: 'none',
+          }}
+          title="Drag to resize"
+        />
+
+        {/* Middle Panel - Editor */}
+        <div 
+          style={{ 
+            flex: 1,
+            color: 'white',
+            display: 'flex',
+            flexDirection: 'column',
+            padding: 0,
+            overflow: 'hidden'
+          }}
+        >
           {/* File Tabs */}
           <FileTabs
             openFiles={openFiles}
             activeFile={activeFile}
-            onSelectFile={(path) => {
-              setActiveFile(path);
-            }}
+            onSelectFile={handleTabSelect}
             onCloseFile={handleCloseFile}
           />
 
@@ -635,22 +828,46 @@ function EditorPage() {
           />
         </div>
 
-        {/* AI Assistant panel */}
-        <div className="col-md-2 bg-dark text-light border-start border-secondary d-flex flex-column" style={{ height: '100vh' }}>
-          <div className="p-3 flex-grow-1 d-flex flex-column" style={{ overflow: 'hidden' }}>
+        {/* Right Resize Handle */}
+        <div
+          onMouseDown={() => setIsResizingRight(true)}
+          style={{
+            width: '5px',
+            backgroundColor: isResizingRight ? '#0d6efd' : '#495057',
+            cursor: 'col-resize',
+            transition: isResizingRight ? 'none' : 'background-color 0.2s',
+            userSelect: 'none',
+          }}
+          title="Drag to resize"
+        />
+
+        {/* Right Panel - AI Assistant */}
+        <div 
+          style={{ 
+            width: `${rightPanelWidth}%`,
+            backgroundColor: '#1a1d29',
+            color: 'white',
+            display: 'flex',
+            flexDirection: 'column',
+            minWidth: '200px',
+            overflow: 'hidden',
+            borderLeft: '1px solid #495057'
+          }}
+        >
+          <div style={{ padding: '1rem', flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             {/* Header */}
-            <div className="mb-3">
-              <h5 className="text-light mb-1 d-flex align-items-center">
+            <div style={{ marginBottom: '1rem' }}>
+              <h5 style={{ color: 'white', marginBottom: '0.25rem', display: 'flex', alignItems: 'center' }}>
                 <i className="bi bi-robot me-2" style={{ fontSize: '1.3rem' }}></i>
                 AI Assistant
               </h5>
-              <small className="text-muted" style={{ fontSize: '0.8rem' }}>
+              <small style={{ color: '#adb5bd', fontSize: '0.8rem' }}>
                 Get help with debugging, syntax, and code suggestions
               </small>
             </div>
 
             {/* Prompt Input */}
-            <div className="mb-3">
+            <div style={{ marginBottom: '1rem' }}>
               <textarea
                 className="form-control bg-secondary text-light border-0 shadow-sm"
                 rows={5}
@@ -666,7 +883,7 @@ function EditorPage() {
             </div>
 
             {/* Action Buttons */}
-            <div className="d-flex gap-2 mb-3">
+            <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
               <button 
                 className="btn btn-primary flex-grow-1" 
                 onClick={sendAiPrompt} 
@@ -695,13 +912,18 @@ function EditorPage() {
             </div>
 
             {/* Response Area */}
-            <div className="flex-grow-1 d-flex flex-column" style={{ minHeight: 0, paddingBottom: '80px' }}>
-              <h6 className="text-light mb-2 d-flex align-items-center">
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, paddingBottom: '80px' }}>
+              <h6 style={{ color: 'white', marginBottom: '0.5rem', display: 'flex', alignItems: 'center' }}>
                 <i className="bi bi-chat-left-dots me-2"></i>Response
               </h6>
               <div 
-                className="flex-grow-1 bg-black text-light p-3 rounded border border-secondary" 
                 style={{ 
+                  flex: 1,
+                  backgroundColor: 'black',
+                  color: 'white',
+                  padding: '1rem',
+                  borderRadius: '0.375rem',
+                  border: '1px solid #495057',
                   overflowY: 'auto',
                   fontSize: '0.85rem',
                   lineHeight: '1.6',
@@ -710,20 +932,20 @@ function EditorPage() {
                 }}
               >
                 {isAiLoading ? (
-                  <div className="text-center text-muted py-4">
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#adb5bd' }}>
                     <div className="spinner-border spinner-border-sm mb-2" role="status">
                       <span className="visually-hidden">Loading...</span>
                     </div>
-                    <p className="mb-0">Analyzing your request...</p>
+                    <p style={{ marginBottom: 0 }}>Analyzing your request...</p>
                   </div>
                 ) : aiResponse ? (
-                  <pre className="mb-0 text-light" style={{ whiteSpace: 'pre-wrap', wordWrap: 'break-word' }}>
+                  <pre style={{ marginBottom: 0, color: 'white', whiteSpace: 'pre-wrap', wordWrap: 'break-word' }}>
                     {aiResponse}
                   </pre>
                 ) : (
-                  <div className="text-center text-muted py-4">
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#adb5bd' }}>
                     <i className="bi bi-lightbulb" style={{ fontSize: '2rem', opacity: 0.3 }}></i>
-                    <p className="mt-2 mb-0" style={{ fontSize: '0.85rem' }}>
+                    <p style={{ marginTop: '0.5rem', marginBottom: 0, fontSize: '0.85rem' }}>
                       Ask me anything about your code!
                     </p>
                   </div>

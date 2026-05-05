@@ -112,6 +112,7 @@ function FileExplorer({ fileStructure, onFileSelect, onCreateFile, onCreateFolde
   const [expandedFolders, setExpandedFolders] = useState(new Set(['/root']));
   const [contextMenu, setContextMenu] = useState(null);
   const [showInputDialog, setShowInputDialog] = useState(null); // { type: 'file' | 'folder' | 'rename', path: string }
+  const [selectedFolderPath, setSelectedFolderPath] = useState('/root'); // Track currently selected folder
 
   const handleToggleFolder = (path) => {
     setExpandedFolders(prev => {
@@ -123,6 +124,8 @@ function FileExplorer({ fileStructure, onFileSelect, onCreateFile, onCreateFolde
       }
       return next;
     });
+    // When folder is clicked, set it as the selected folder
+    setSelectedFolderPath(path);
   };
 
   const handleContextMenu = (e, path, isFolder) => {
@@ -201,7 +204,7 @@ function FileExplorer({ fileStructure, onFileSelect, onCreateFile, onCreateFolde
         <div style={{ display: 'flex', gap: '4px' }}>
           <button 
             className="btn btn-sm btn-outline-secondary text-light" 
-            onClick={() => setShowInputDialog({ type: 'file', path: '/root' })}
+            onClick={() => setShowInputDialog({ type: 'file', path: selectedFolderPath })}
             title="New File"
             style={{ fontSize: '0.7rem', padding: '2px 6px' }}
           >
@@ -209,7 +212,7 @@ function FileExplorer({ fileStructure, onFileSelect, onCreateFile, onCreateFolde
           </button>
           <button 
             className="btn btn-sm btn-outline-secondary text-light" 
-            onClick={() => setShowInputDialog({ type: 'folder', path: '/root' })}
+            onClick={() => setShowInputDialog({ type: 'folder', path: selectedFolderPath })}
             title="New Folder"
             style={{ fontSize: '0.7rem', padding: '2px 6px' }}
           >

@@ -68,25 +68,40 @@ npm install
 
 3. Environment variables
 
-Create a `server/.env` file (do not commit `.env` to GitHub). The server expects at least:
+**Copy from examples:**
+```bash
+# Server
+cp server/.env.example server/.env
 
+# Client  
+cp client/.env.example client/.env
 ```
-HUGGINGFACE_API_KEY=<your_api_key_here>
-FRONTEND_URL=https://your-frontend-domain.example
-PORT=5002 # optional, default 5002
+
+**Server Configuration** (`server/.env`):
+```env
+PORT=5002
+MONGO_URI=mongodb://localhost:27017/live-syntax
+FRONTEND_URL=http://localhost:3000
+GROQ_API_KEY=your_groq_api_key_here
 ```
 
-Notes:
-- The code uses `HUGGINGFACE_API_KEY` as the environment variable name in the server; it contains the Groq API key in this repo's setup.
-- The Piston API used for compilation does not require a key.
-
-For the client, during local development create `client/.env`:
-
-```
+**Client Configuration** (`client/.env`):
+```env
 REACT_APP_BACKEND_URL=http://localhost:5002
 ```
 
-For production builds on Vercel, set `REACT_APP_BACKEND_URL` in the Vercel Project Environment Variables (Production).
+**Environment Variables Guide:**
+- `.env` - Your **local** configuration (add to `.gitignore`)
+- `.env.example` - Template showing what variables are needed
+- `.env.production` (client only) - Used for production builds on Vercel
+
+**Setup Steps:**
+1. Create local `.env` files from `.env.example` templates
+2. Get a **free Groq API key** at https://console.groq.com
+3. Set up MongoDB:
+   - **Local**: Run `mongod` on your machine
+   - **Cloud**: Use MongoDB Atlas (free tier available)
+4. Fill in your values in `.env` files
 
 4. Run server and client
 

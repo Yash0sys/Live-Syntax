@@ -5,15 +5,22 @@ const { Server } = require("socket.io");
 const ACTIONS = require("./Actions");
 const cors = require("cors");
 const axios = require("axios");
+const mongoose = require("mongoose");
+const Project = require("./models/Project");
 const server = http.createServer(app);
 require("dotenv").config();
 
+// Connect to MongoDB
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/live-syntax';
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch((err) => console.error('MongoDB connection error:', err));
+
 const languageConfig = {
-  // Piston API language mappings
-  python3: { pistonLang: 'python', extension: 'py' },
-  java: { pistonLang: 'java', extension: 'java' },
-  cpp: { pistonLang: 'c++', extension: 'cpp' },
-  c: { pistonLang: 'c', extension: 'c' },
+  python3: { extension: 'py' },
+  java: { extension: 'java' },
+  cpp: { extension: 'cpp' },
+  c: { extension: 'c' },
 };
 
 // Enable CORS
@@ -49,6 +56,72 @@ const roomHosts = {}; // Track the host (first user) of each room
 const pendingJoinRequests = {}; // Track users waiting for approval
 const roomFileStructures = {}; // Track file structure for each room
 const roomFileContents = {}; // Track file contents for each room
+
+// Helper function to get item at path in file structure
+const getItemAtPath = (structure, path) => {
+  const parts = path.split('/').filter(p => p && p !== 'root');
+  let current = structure;
+  
+  for (const part of parts) {
+    if (!current.children || !current.children[part]) {
+      return null;
+    }
+    current = current.children[part];
+  }
+  return current;
+};
+
+// Helper function to set item at path in file structure
+const setItemAtPath = (structure, path, item) => {
+  const parts = path.split('/').filter(p => p && p !== 'root');
+  let current = structure;
+  
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!current.children[parts[i]]) {
+      current.children[parts[i]] = { name: parts[i], type: 'folder', children: {} };
+    }
+    current = current.children[parts[i]];
+  }
+  
+  if (parts.length > 0) {
+    const lastName = parts[parts.length - 1];
+    current.children[lastName] = item;
+  }
+};
+
+// Helper function to delete item at path in file structure
+const deleteItemAtPath = (structure, path) => {
+  const parts = path.split('/').filter(p => p && p !== 'root');
+  let current = structure;
+  
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!current.children[parts[i]]) return;
+    current = current.children[parts[i]];
+  }
+  
+  if (parts.length > 0) {
+    const lastName = parts[parts.length - 1];
+    delete current.children[lastName];
+  }
+};
+
+// Helper function to rename item at path
+const renameItemAtPath = (structure, oldPath, newPath) => {
+  const item = getItemAtPath(structure, oldPath);
+  if (!item) return;
+  
+  const newName = newPath.split('/').pop();
+  item.name = newName;
+  
+  const oldParts = oldPath.split('/').filter(p => p && p !== 'root');
+  const newParts = newPath.split('/').filter(p => p && p !== 'root');
+  
+  // If parent directory changed, move the item
+  if (oldParts.slice(0, -1).join('/') !== newParts.slice(0, -1).join('/')) {
+    deleteItemAtPath(structure, oldPath);
+    setItemAtPath(structure, newPath, item);
+  }
+};
 
 const getAllConnectedClients = (roomId) => {
   return Array.from(io.sockets.adapter.rooms.get(roomId) || []).map(
@@ -171,11 +244,33 @@ io.on("connection", (socket) => {
 
   // sync the code - broadcast changes to all other users in the room
   socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change, filePath }) => {
+    console.log("📨 CODE_CHANGE received from client:", { userId: socket.id, roomId, filePath, codeLength: code?.length });
+    
     socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code, change, filePath });
+    console.log("📤 CODE_CHANGE broadcasted to room:", { roomId, filePath });
     
     // Update file content in room storage
     if (filePath && roomFileContents[roomId]) {
       roomFileContents[roomId][filePath] = code;
+      
+      // Save to MongoDB immediately
+      Project.findOneAndUpdate(
+        { roomId },
+        {
+          fileContents: roomFileContents[roomId],
+          updatedAt: new Date(),
+        },
+        { upsert: true }
+      ).then(() => {
+        // Broadcast FILE_STRUCTURE_UPDATE to ALL users (including sender) so fileContents state updates from MongoDB
+        io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+          fileContents: roomFileContents[roomId],
+          fileStructure: roomFileStructures[roomId] || {},
+        });
+        console.log("📡 FILE_STRUCTURE_UPDATE broadcast to all users after CODE_CHANGE");
+      }).catch(err => console.error("Error saving to MongoDB:", err));
+      
+      console.log("💾 File saved to MongoDB:", { roomId, filePath });
     }
   });
   
@@ -190,50 +285,164 @@ io.on("connection", (socket) => {
   });
   
   // File structure sync - when new user joins, send them the file structure
-  socket.on(ACTIONS.FILE_STRUCTURE_SYNC, ({ fileStructure, fileContents, socketId }) => {
-    // Store the file structure for this room
+  socket.on(ACTIONS.FILE_STRUCTURE_SYNC, async ({ fileStructure, fileContents, socketId }) => {
+    // Get the room ID
     const roomId = Array.from(socket.rooms).find(r => r !== socket.id);
-    if (!roomFileStructures[roomId]) {
-      roomFileStructures[roomId] = fileStructure;
-      roomFileContents[roomId] = fileContents;
+    
+    console.log("📁 FILE_STRUCTURE_SYNC received:", { roomId, files: Object.keys(fileContents || {}) });
+    
+    try {
+      // Check if project exists in MongoDB
+      const existingProject = await Project.findOne({ roomId });
+      
+      if (existingProject) {
+        // Project exists - load from MongoDB (source of truth)
+        console.log("✅ Project found in MongoDB - loading existing data:", { roomId, files: Object.keys(existingProject.fileContents || {}) });
+        roomFileStructures[roomId] = existingProject.fileStructure;
+        roomFileContents[roomId] = existingProject.fileContents || {};
+      } else {
+        // Project doesn't exist - this is the first user, save their structure
+        roomFileStructures[roomId] = fileStructure;
+        roomFileContents[roomId] = fileContents || {};
+        
+        // Save to MongoDB
+        await Project.create({
+          roomId,
+          fileStructure,
+          fileContents: fileContents || {},
+          projectName: `Project-${roomId.slice(0, 8)}`,
+        });
+        console.log("✅ New project created in MongoDB:", { roomId, files: Object.keys(fileContents || {}) });
+      }
+    } catch (err) {
+      console.error("Error in FILE_STRUCTURE_SYNC:", err);
     }
     
-    // Send current room's file structure to the new user
+    // Send the current server state to BOTH the new user AND all existing users in the room
+    // This ensures everyone stays in sync with MongoDB (the source of truth)
+    const filesToSend = roomFileContents[roomId] || {};
+    console.log("📤 FILE_STRUCTURE_UPDATE sending to client:", { 
+      socketId, 
+      roomId, 
+      files: Object.keys(filesToSend),
+      fileContents: filesToSend
+    });
+    
+    // Update only the joining user
     io.to(socketId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: filesToSend,
+    });
+    
+    // ALSO broadcast to all other users in the room to keep them in sync
+    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: filesToSend,
+    });
+    
+    console.log("📢 FILE_STRUCTURE_UPDATE broadcasted to all users in room:", { roomId });
+  });
+  
+  // File operations - broadcast to all users in room
+  socket.on(ACTIONS.FILE_CREATE, ({ roomId, path, fileName }) => {
+    console.log("📄 FILE_CREATE received:", { roomId, path, fileName });
+    
+    // Initialize room's file contents if not already done
+    if (!roomFileContents[roomId]) {
+      roomFileContents[roomId] = {};
+    }
+    
+    // Update server-side file structure
+    if (roomFileStructures[roomId]) {
+      setItemAtPath(roomFileStructures[roomId], path, {
+        name: fileName,
+        type: 'file',
+        content: '',
+      });
+      roomFileContents[roomId][path] = '';
+      
+      // Save to MongoDB immediately
+      Project.findOneAndUpdate(
+        { roomId },
+        {
+          fileStructure: roomFileStructures[roomId],
+          fileContents: roomFileContents[roomId],
+          updatedAt: new Date(),
+        },
+        { upsert: true }
+      ).catch(err => console.error("Error saving FILE_CREATE to MongoDB:", err));
+      
+      console.log("💾 File saved to MongoDB:", { roomId, path });
+    }
+    
+    // Broadcast complete updated structure to all users in room
+    io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: roomFileContents[roomId],
+    });
+    console.log("📤 FILE_STRUCTURE_UPDATE broadcasted after file creation:", { roomId, path });
+  });
+  
+  socket.on(ACTIONS.FOLDER_CREATE, ({ roomId, path, folderName }) => {
+    // Initialize room's file contents if not already done
+    if (!roomFileContents[roomId]) {
+      roomFileContents[roomId] = {};
+    }
+    
+    // Update server-side file structure
+    if (roomFileStructures[roomId]) {
+      setItemAtPath(roomFileStructures[roomId], path, {
+        name: folderName,
+        type: 'folder',
+        children: {},
+      });
+    }
+    
+    // Broadcast complete updated structure to all users in room
+    io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
       fileStructure: roomFileStructures[roomId],
       fileContents: roomFileContents[roomId],
     });
   });
   
-  // File operations - broadcast to all users in room
-  socket.on(ACTIONS.FILE_CREATE, ({ roomId, path, fileName }) => {
-    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
-      action: 'create-file',
-      path,
-      fileName,
-    });
-  });
-  
-  socket.on(ACTIONS.FOLDER_CREATE, ({ roomId, path, folderName }) => {
-    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
-      action: 'create-folder',
-      path,
-      folderName,
-    });
-  });
-  
   socket.on(ACTIONS.FILE_DELETE, ({ roomId, path }) => {
-    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
-      action: 'delete',
-      path,
+    // Initialize room's file contents if not already done
+    if (!roomFileContents[roomId]) {
+      roomFileContents[roomId] = {};
+    }
+    
+    // Update server-side file structure
+    if (roomFileStructures[roomId]) {
+      deleteItemAtPath(roomFileStructures[roomId], path);
+      delete roomFileContents[roomId][path];
+    }
+    
+    // Broadcast complete updated structure to all users in room
+    io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: roomFileContents[roomId],
     });
   });
   
   socket.on(ACTIONS.FILE_RENAME, ({ roomId, oldPath, newPath }) => {
-    socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
-      action: 'rename',
-      oldPath,
-      newPath,
+    // Initialize room's file contents if not already done
+    if (!roomFileContents[roomId]) {
+      roomFileContents[roomId] = {};
+    }
+    
+    // Update server-side file structure
+    if (roomFileStructures[roomId]) {
+      renameItemAtPath(roomFileStructures[roomId], oldPath, newPath);
+      if (roomFileContents[roomId][oldPath]) {
+        roomFileContents[roomId][newPath] = roomFileContents[roomId][oldPath];
+        delete roomFileContents[roomId][oldPath];
+      }
+    }
+    
+    // Broadcast complete updated structure to all users in room
+    io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
+      fileStructure: roomFileStructures[roomId],
+      fileContents: roomFileContents[roomId],
     });
   });
   
@@ -358,6 +567,102 @@ app.get("/health", async (req, res)=>{ res.json({
     });
   });
 
+// Save project to MongoDB
+app.post("/save-project", async (req, res) => {
+  try {
+    const { roomId, fileStructure, projectName } = req.body;
+
+    if (!roomId) {
+      return res.status(400).json({ error: 'roomId is required' });
+    }
+
+    // Use the in-memory fileContents (already synced to MongoDB on every change)
+    const fileContents = roomFileContents[roomId] || {};
+
+    const project = await Project.findOneAndUpdate(
+      { roomId },
+      {
+        roomId,
+        fileStructure,
+        fileContents,
+        projectName: projectName || 'Untitled Project',
+        updatedAt: new Date(),
+      },
+      { upsert: true, new: true }
+    );
+
+    res.json({
+      success: true,
+      message: 'Project saved successfully',
+      project,
+    });
+  } catch (err) {
+    console.error('Error saving project:', err);
+    res.status(500).json({ 
+      error: 'Failed to save project',
+      details: err.message 
+    });
+  }
+});
+
+// Load project from MongoDB
+app.get("/load-project/:roomId", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+
+    const project = await Project.findOne({ roomId });
+
+    if (!project) {
+      return res.status(404).json({ 
+        error: 'Project not found',
+        message: 'No saved project found for this room ID'
+      });
+    }
+
+    res.json({
+      success: true,
+      fileStructure: project.fileStructure,
+      fileContents: project.fileContents,
+      projectName: project.projectName,
+      createdAt: project.createdAt,
+      updatedAt: project.updatedAt,
+    });
+  } catch (err) {
+    console.error('Error loading project:', err);
+    res.status(500).json({ 
+      error: 'Failed to load project',
+      details: err.message 
+    });
+  }
+});
+
+// Delete project from MongoDB
+app.delete("/delete-project/:roomId", async (req, res) => {
+  try {
+    const { roomId } = req.params;
+
+    // Delete from MongoDB
+    const result = await Project.deleteOne({ roomId });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ 
+        error: 'Project not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Project deleted successfully',
+    });
+  } catch (err) {
+    console.error('Error deleting project:', err);
+    res.status(500).json({ 
+      error: 'Failed to delete project',
+      details: err.message 
+    });
+  }
+});
+
 app.post("/compile", async (req, res) => {
   const { code, language, input = "" } = req.body;
 
@@ -366,33 +671,45 @@ app.post("/compile", async (req, res) => {
   }
 
   try {
-    const { pistonLang, extension } = languageConfig[language];
+    // Map our languages to Glot.io languages
+    const glotLanguages = {
+      python3: "python",
+      java: "java",
+      cpp: "cpp",
+      c: "c"
+    };
     
-    const response = await axios.post("https://emkc.org/api/v2/piston/execute", {
-      language: pistonLang,
-      version: '*',
-      files: [{
-        name: `main.${extension}`,
-        content: code
-      }],
+    const glotLang = glotLanguages[language];
+    if (!glotLang) {
+      return res.status(400).json({ error: `Unsupported language: ${language}` });
+    }
+    
+    const response = await axios.post(`https://glot.io/api/run/${glotLang}`, {
+      files: [
+        {
+          name: `main.${languageConfig[language].extension}`,
+          content: code
+        }
+      ],
       stdin: input
     }, {
       headers: {
-        'Content-Type': 'application/json',
-      }
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
     });
 
     const result = response.data;
     
     res.json({
-      output: result.run?.stdout || "No output",
-      error: result.run?.stderr || null
+      output: result.stdout || result.stderr || "No output",
+      error: result.stderr || null
     });
 
   } catch (error) {
     res.status(500).json({ 
       error: "Failed to compile code",
-      details: error.response?.data || error.message
+      details: error.message
     });
   }
 });
@@ -400,7 +717,7 @@ app.post("/compile", async (req, res) => {
 // AI assistant endpoint - uses Groq API (free and fast)
 app.post("/ai", async (req, res) => {
   const { prompt = "", code = "", language = "" } = req.body;
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = (process.env.GROQ_API_KEY || '').trim();
 
   if (!apiKey || apiKey === 'your_groq_api_key_here') {
     return res.status(500).json({ 

@@ -61,6 +61,11 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
   const suppressRemoteChangeRef = useRef(false); // Flag to prevent circular updates
   const currentFileRef = useRef(activeFile);
 
+  // Keep currentFileRef in sync with activeFile prop
+  useEffect(() => {
+    currentFileRef.current = activeFile;
+  }, [activeFile]);
+
   useEffect(() => {
     const init = async () => {
       const editor = CodeMirror.fromTextArea(
@@ -95,36 +100,50 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
       editor.on("change", (instance, changeObj) => {
         const { origin } = changeObj;
         
-        if (origin !== "setValue" && !suppressRemoteChangeRef.current) {
-          const code = instance.getValue();
-          onCodeChange(code);
-          
-          // Send the change delta for better collaboration
-          socketRef.current.emit(ACTIONS.CODE_CHANGE, {
-            roomId,
-            code,
-            change: {
-              from: changeObj.from,
-              to: changeObj.to,
-              text: changeObj.text,
-              origin: changeObj.origin
-            },
-            filePath: currentFileRef.current, // Include file path in sync
-          });
+        // Skip changes from setValue and when suppressed for remote updates
+        if (origin === "setValue" || suppressRemoteChangeRef.current) {
+          return;
         }
+        
+        const code = instance.getValue();
+        // Ensure filePath is always defined (fallback to index.js if not set)
+        const filePath = currentFileRef.current || '/root/index.js';
+        
+        // Debug log
+        console.log("✍️ Local change detected:", { filePath, codeLength: code.length, codePreview: code.substring(0, 50) });
+        
+        onCodeChange(code, filePath);
+        
+        // Send the change delta for better collaboration
+        socketRef.current.emit(ACTIONS.CODE_CHANGE, {
+          roomId,
+          code,
+          change: {
+            from: changeObj.from,
+            to: changeObj.to,
+            text: changeObj.text,
+            origin: changeObj.origin
+          },
+          filePath: filePath,
+        });
+        console.log("📤 CODE_CHANGE emitted to server:", { filePath, roomId });
       });
     };
 
     init();
   }, []);
 
-  // Update editor content when active file changes
+  // Update editor content when active file changes (NOT when fileContent updates alone)
+  // BUT we DO need to update on initial fileContent load from MongoDB
   useEffect(() => {
     if (editorRef.current && activeFile) {
       currentFileRef.current = activeFile;
       suppressRemoteChangeRef.current = true;
       
+      console.log("📂 Editor loading file:", { activeFile, fileContent: fileContent?.substring(0, 50), fileContentLength: fileContent?.length });
+      
       const cursor = editorRef.current.getCursor();
+      // Load the file content passed in as prop (this is fileContents[activeFile] from EditorPage)
       editorRef.current.setValue(fileContent || "");
       editorRef.current.setCursor(cursor);
       
@@ -137,7 +156,7 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
         suppressRemoteChangeRef.current = false;
       }, 10);
     }
-  }, [activeFile, fileContent, language]);
+  }, [activeFile, language, fileContent]);
 
   // Handle incoming code and cursor changes
   useEffect(() => {
